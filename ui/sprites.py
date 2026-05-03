@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from textual.app import ComposeResult
 from textual.geometry import Offset
 from textual.reactive import reactive
 from textual.widgets import Static
@@ -8,22 +7,28 @@ from textual.widgets import Static
 from ui.office_map import ZONES, ZONE_LABELS
 
 # ── Agent definitions ─────────────────────────────────────────────────────────
-# (name) → (emoji, accent_color_hex, home_zone)
+# (emoji, accent_color_hex, home_zone)
 AGENT_DEFS: dict[str, tuple[str, str, str]] = {
     "Orchestrator": ("🤖", "#00FF88", "HRBP_DESK"),
     "Accountant":   ("💰", "#FFD700", "VAULT"),
     "Librarian":    ("📚", "#00BFFF", "ARCHIVE"),
     "Recruiter":    ("👥", "#FF69B4", "HR_HALL"),
+    "CommsExpert":  ("🔗", "#FF8C00", "HR_HALL"),
+    "Tester":       ("🐞", "#9B59B6", "SERVER_ROOM"),
+    "QA_Critic":    ("🔬", "#E74C3C", "ARCHIVE"),
+    "Analyst":      ("📊", "#2ECC71", "ARCHIVE"),
 }
 
-# ── Pixel art frames (5 chars wide, 3 rows each) ──────────────────────────────
-# Each tuple: (top_row, middle_row, bottom_row)
-# The middle row uses a placeholder "E" that gets replaced with the real emoji.
+# ── Pixel-art animation frames ────────────────────────────────────────────────
+# 3 rows × 6 chars. "E" is replaced by the agent's emoji at render time.
 _FRAMES: list[tuple[str, str, str]] = [
     ("▄▄█▄▄", "█ E █", "▀▀▀▀▀"),
     ("▄█▄█▄", "█ E █", "▀▄▀▄▀"),
     ("▄▄█▄▄", "█ E █", "▀▀▀▀▀"),
 ]
+
+# Idle frame (dimmed, static)
+_IDLE_FRAME = ("░░█░░", "░ E ░", "░░░░░")
 
 
 class AgentSprite(Static):
@@ -40,9 +45,7 @@ class AgentSprite(Static):
     }
     """
 
-    # Reactive attribute drives re-render on frame change
     _frame_index: reactive[int] = reactive(0)
-    _status: reactive[str] = reactive("idle")
 
     def __init__(
         self,
@@ -53,30 +56,37 @@ class AgentSprite(Static):
         *,
         widget_id: str | None = None,
     ) -> None:
-        super().__init__(id=widget_id or f"sprite-{name.lower()}")
-        self.agent_name = name
-        self.emoji = emoji
-        self.color = color
-        self.home_zone = home_zone
+        super().__init__(id=widget_id or f"sprite-{name.lower().replace('_', '-')}")
+        self.agent_name  = name
+        self.emoji       = emoji
+        self.color       = color
+        self.home_zone   = home_zone
         self.current_zone = home_zone
+        self._is_idle    = False
+        self._timer      = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def on_mount(self) -> None:
-        self.set_interval(0.45, self._next_frame)
-        x, y = ZONES[self.home_zone]
+        self._timer = self.set_interval(0.45, self._next_frame)
+        x, y = ZONES.get(self.home_zone, (4, 4))
         self.styles.offset = Offset(x, y)
 
     # ── Rendering ─────────────────────────────────────────────────────────────
 
     def _render_sprite(self) -> str:
-        top, mid, bot = _FRAMES[self._frame_index]
+        if self._is_idle:
+            top, mid, bot = _IDLE_FRAME
+        else:
+            top, mid, bot = _FRAMES[self._frame_index]
         mid = mid.replace("E", self.emoji)
         c = self.color
+        dim = "[dim]" if self._is_idle else ""
+        end_dim = "[/dim]" if self._is_idle else ""
         lines = [
-            f"[bold {c}]{top}[/]",
-            f"[bold {c}]{mid}[/]",
-            f"[bold {c}]{bot}[/]",
+            f"{dim}[bold {c}]{top}[/]{end_dim}",
+            f"{dim}[bold {c}]{mid}[/]{end_dim}",
+            f"{dim}[bold {c}]{bot}[/]{end_dim}",
         ]
         return "\n".join(lines)
 
@@ -86,52 +96,54 @@ class AgentSprite(Static):
     # ── Animation helpers ─────────────────────────────────────────────────────
 
     def _next_frame(self) -> None:
-        self._frame_index = (self._frame_index + 1) % len(_FRAMES)
-        self.update(self._render_sprite())
-
-    def watch__frame_index(self, _value: int) -> None:
-        self.update(self._render_sprite())
+        if not self._is_idle:
+            self._frame_index = (self._frame_index + 1) % len(_FRAMES)
+            self.update(self._render_sprite())
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def move_to(self, zone: str) -> None:
-        """Animate the sprite to the given zone."""
         if zone not in ZONES:
-            raise ValueError(f"Unknown zone: {zone!r}")
+            return
         x, y = ZONES[zone]
         self.current_zone = zone
-        self._status = "moving"
         self.styles.animate(
             "offset",
             value=Offset(x, y),
             duration=1.5,
             easing="in_out_quart",
-            on_complete=self._on_move_done,
         )
 
-    def _on_move_done(self) -> None:
-        self._status = "idle"
-
     def set_idle(self, idle: bool) -> None:
-        """Fade sprite to indicate idle state."""
-        target_opacity = 0.3 if idle else 1.0
+        self._is_idle = idle
+        target_opacity = 0.35 if idle else 1.0
         self.styles.animate("opacity", value=target_opacity, duration=0.5)
-        self._status = "idle" if idle else "working"
+        self.update(self._render_sprite())
 
     def set_working(self) -> None:
-        self.set_idle(False)
-        self._status = "working"
+        self._is_idle = False
+        self.styles.animate("opacity", value=1.0, duration=0.2)
+        self.update(self._render_sprite())
 
     @property
     def zone_label(self) -> str:
         return ZONE_LABELS.get(self.current_zone, self.current_zone)
 
+    @property
+    def current_offset(self) -> Offset:
+        return self.styles.offset or Offset(0, 0)
+
 
 # ── Factory ───────────────────────────────────────────────────────────────────
 
-def create_all_sprites() -> list[AgentSprite]:
-    """Instantiate one AgentSprite per entry in AGENT_DEFS."""
-    sprites: list[AgentSprite] = []
-    for name, (emoji, color, home_zone) in AGENT_DEFS.items():
-        sprites.append(AgentSprite(name, emoji, color, home_zone))
+def create_sprites_for(names: list[str]) -> list[AgentSprite]:
+    sprites = []
+    for name in names:
+        if name in AGENT_DEFS:
+            emoji, color, home_zone = AGENT_DEFS[name]
+            sprites.append(AgentSprite(name, emoji, color, home_zone))
     return sprites
+
+
+def create_all_sprites() -> list[AgentSprite]:
+    return create_sprites_for(list(AGENT_DEFS.keys()))
