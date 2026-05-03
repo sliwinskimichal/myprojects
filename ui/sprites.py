@@ -67,8 +67,12 @@ class AgentSprite(Static):
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
+    # Normal and working frame intervals (seconds)
+    _INTERVAL_IDLE    = 0.55
+    _INTERVAL_WORKING = 0.15
+
     def on_mount(self) -> None:
-        self._timer = self.set_interval(0.45, self._next_frame)
+        self._timer = self.set_interval(self._INTERVAL_IDLE, self._next_frame)
         x, y = ZONES.get(self.home_zone, (4, 4))
         self.styles.offset = Offset(x, y)
 
@@ -118,11 +122,22 @@ class AgentSprite(Static):
         self._is_idle = idle
         target_opacity = 0.35 if idle else 1.0
         self.styles.animate("opacity", value=target_opacity, duration=0.5)
+        # Slow animation when idle
+        if self._timer:
+            self._timer.stop()
+        self._timer = self.set_interval(
+            self._INTERVAL_IDLE if idle else self._INTERVAL_WORKING,
+            self._next_frame,
+        )
         self.update(self._render_sprite())
 
     def set_working(self) -> None:
         self._is_idle = False
         self.styles.animate("opacity", value=1.0, duration=0.2)
+        # Speed up animation to show activity
+        if self._timer:
+            self._timer.stop()
+        self._timer = self.set_interval(self._INTERVAL_WORKING, self._next_frame)
         self.update(self._render_sprite())
 
     @property

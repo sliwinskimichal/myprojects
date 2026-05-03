@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS task_history (
     agent_id    TEXT,
     tokens_used INTEGER,
     cost_usd    REAL,
+    model_used  TEXT,
     timestamp   TEXT
 );
 
@@ -105,12 +106,14 @@ class Database:
         agent_id: str,
         tokens_used: int,
         cost_usd: float,
+        model_used: str = "",
     ) -> None:
         assert self._conn
         ts = datetime.now(timezone.utc).isoformat()
         self._conn.execute(
-            "INSERT INTO task_history (task_type, agent_id, tokens_used, cost_usd, timestamp) VALUES (?,?,?,?,?)",
-            (task_type, agent_id, tokens_used, cost_usd, ts),
+            "INSERT INTO task_history (task_type, agent_id, tokens_used, cost_usd, model_used, timestamp) "
+            "VALUES (?,?,?,?,?,?)",
+            (task_type, agent_id, tokens_used, cost_usd, model_used, ts),
         )
         self._conn.commit()
 

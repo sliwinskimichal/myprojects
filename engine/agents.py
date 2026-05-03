@@ -116,6 +116,7 @@ class TokenAccountant:
     - Cost estimation before call (fires cost_callback)
     - Prompt caching via cache_control on system prompts
     - Mock mode when API key is absent
+    - Daily budget cap (blocks call if exceeded)
     - SQLite usage logging
     """
 
@@ -124,13 +125,15 @@ class TokenAccountant:
         db: "Database | None" = None,
         api_key: str | None = None,
         cost_callback: Callable[[str, float, str], None] | None = None,
+        daily_budget_usd: float = 1.0,
     ) -> None:
-        self.db            = db
-        self._api_key      = api_key
-        self._client: Any  = None
-        self._mock_mode    = not bool(api_key)
-        # cost_callback(agent_id, estimated_cost, model_name)
-        self.cost_callback = cost_callback
+        self.db                 = db
+        self._api_key           = api_key
+        self._client: Any       = None
+        self._mock_mode         = not bool(api_key)
+        self.cost_callback      = cost_callback
+        self.daily_budget_usd   = daily_budget_usd
+        self._session_cost: float = 0.0     # cost accrued in this process session
 
     # ── Lazy client ───────────────────────────────────────────────────────────
 
@@ -186,10 +189,10 @@ class TokenAccountant:
         tokens_used = self._rough_token_count(prompt) + self._rough_token_count(content)
         cost_usd = (tokens_used / 1000) * _COST_PER_1K.get(model, _COST_PER_1K[MODEL_SONNET])
         if self.db:
-            self.db.log_task(task_type, agent_id, tokens_used, cost_usd)
+            self.db.log_task(task_type, agent_id, tokens_used, cost_usd, model + "[mock]")
         return {
             "content":        content,
-            "model":          model + " [mock]",
+            "model":          model + "[mock]",
             "tokens_used":    tokens_used,
             "cost_usd":       cost_usd,
             "estimated_cost": est_cost,
@@ -219,7 +222,17 @@ class TokenAccountant:
             self.cost_callback(agent_id, est_cost, model)
 
         if self._mock_mode:
-            return self._mock_call(optimised, task_type, agent_id, model, est_cost)
+            result = self._mock_call(optimised, task_type, agent_id, model, est_cost)
+            self._session_cost += result["cost_usd"]
+            return result
+
+        # Budget guard
+        if self._session_cost >= self.daily_budget_usd:
+            raise RuntimeError(
+                f"Daily budget cap ${self.daily_budget_usd:.2f} reached "
+                f"(session: ${self._session_cost:.4f}). "
+                f"Increase daily_budget_usd or restart."
+            )
 
         # ── Real API call ─────────────────────────────────────────────────────
         messages = [{"role": "user", "content": optimised}]
@@ -231,7 +244,6 @@ class TokenAccountant:
 
         if system:
             clean_system = self.optimize_prompt(system)
-            # Add prompt caching on system prompt (reduces cost on repeated calls)
             kwargs["system"] = [
                 {
                     "type": "text",
@@ -239,12 +251,7 @@ class TokenAccountant:
                     "cache_control": {"type": "ephemeral"},
                 }
             ]
-            kwargs.setdefault("betas", [])
-            if "prompt-caching-2024-07-31" not in kwargs["betas"]:
-                kwargs["betas"] = ["prompt-caching-2024-07-31"]
-        else:
-            if system:
-                kwargs["system"] = self.optimize_prompt(system)
+            kwargs["betas"] = ["prompt-caching-2024-07-31"]
 
         client   = self._get_client()
         response = client.messages.create(**kwargs)
@@ -253,8 +260,10 @@ class TokenAccountant:
         tokens_used = response.usage.input_tokens + response.usage.output_tokens
         cost_usd    = (tokens_used / 1000) * _COST_PER_1K.get(model, _COST_PER_1K[MODEL_SONNET])
 
+        self._session_cost += cost_usd
+
         if self.db:
-            self.db.log_task(task_type, agent_id, tokens_used, cost_usd)
+            self.db.log_task(task_type, agent_id, tokens_used, cost_usd, model)
 
         return {
             "content":        content,
@@ -262,6 +271,15 @@ class TokenAccountant:
             "tokens_used":    tokens_used,
             "cost_usd":       cost_usd,
             "estimated_cost": est_cost,
+        }
+
+    @property
+    def session_stats(self) -> dict[str, Any]:
+        return {
+            "session_cost": self._session_cost,
+            "budget_remaining": max(0.0, self.daily_budget_usd - self._session_cost),
+            "budget_pct": min(100.0, (self._session_cost / self.daily_budget_usd) * 100),
+            "mock_mode": self._mock_mode,
         }
 
 
