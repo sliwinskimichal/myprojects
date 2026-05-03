@@ -20,6 +20,7 @@ Key bindings:
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Any
 
 from textual.app import App, ComposeResult
@@ -28,7 +29,7 @@ from textual.containers import Container
 from textual.message import Message
 from textual.widgets import Footer, Header, Log, Static
 
-from ui.office_map import OFFICE_MAP, ZONE_LABELS
+from ui.office_map import ZONE_LABELS, make_live_map
 from ui.speech_bubble import SpeechBubble
 from ui.sprites import AGENT_DEFS, AgentSprite, create_sprites_for
 from ui.dialogs import ContextSelectScreen, FeedbackScreen, TaskInputScreen
@@ -44,7 +45,13 @@ from engine.office_graph import build_graph
 
 class TaskCompleted(Message):
     def __init__(
-        self, agent_id: str, result: str, cost: float, tokens: int, model: str = ""
+        self,
+        agent_id: str,
+        result: str,
+        cost: float,
+        tokens: int,
+        model: str = "",
+        routing: str = "",
     ) -> None:
         super().__init__()
         self.agent_id = agent_id
@@ -52,6 +59,7 @@ class TaskCompleted(Message):
         self.cost     = cost
         self.tokens   = tokens
         self.model    = model
+        self.routing  = routing   # "Orchestrator → Agent (task_type)"
 
 
 class CostEstimate(Message):
@@ -278,6 +286,7 @@ class PixelHRApp(App[None]):
         self._active_agents:  list[str] = []
         self._last_results:   dict[str, str] = {}
         self._bubble_counter  = 0
+        self._agent_zones:    dict[str, list[str]] = {}
 
     # ── Composition ───────────────────────────────────────────────────────────
 
@@ -289,7 +298,7 @@ class PixelHRApp(App[None]):
             yield Static("", id="budget-bar")
             yield Static("", id="night-watch-banner")
             with Container(id="map-container"):
-                yield Static(OFFICE_MAP, id="office-map")
+                yield Static(make_live_map({}), id="office-map")
                 with Container(id="agent-layer"):
                     pass   # sprites mounted dynamically
 
@@ -337,6 +346,7 @@ class PixelHRApp(App[None]):
         self._update_budget_bar()
         self.set_interval(cfg.app.demo_interval, self._demo_loop)
         self.set_interval(15.0, self._update_budget_bar)
+        self.set_interval(2.5,  self._update_office_map)
 
     # ── Context management ────────────────────────────────────────────────────
 
@@ -386,6 +396,7 @@ class PixelHRApp(App[None]):
             f" {ctx.icon}  {ctx.name.replace('_', ' ')}  —  {ctx.description}",
         )
         self._update_roster()
+        self._update_office_map()
         self._log(f"Context → {ctx.icon} {ctx.name.replace('_', ' ')}")
         self._log(f"Roster: {', '.join(self._active_agents)}")
 
@@ -540,6 +551,7 @@ class PixelHRApp(App[None]):
             sprite.set_working()
 
         state = AgentState(agent_id=target_agent, task=task).model_dump()
+        self._update_office_map()
         self.run_worker(
             lambda s=state: self._graph_worker(s),
             thread=True,
@@ -553,15 +565,23 @@ class PixelHRApp(App[None]):
             return
         agent_id = state.get("agent_id", "?")
         try:
-            result = self._graph.invoke(state)
+            result       = self._graph.invoke(state)
+            final_agent  = result.get("agent_id", agent_id)
+            task_type    = result.get("task_type", "")
+            routing      = (
+                f"{agent_id} → {final_agent} ({task_type})"
+                if final_agent != agent_id
+                else ""
+            )
             self.call_from_thread(
                 self.post_message,
                 TaskCompleted(
-                    agent_id=result.get("agent_id", agent_id),
+                    agent_id=final_agent,
                     result=result.get("last_result", ""),
                     cost=result.get("cost_usd", 0.0),
                     tokens=result.get("tokens_used", 0),
                     model=result.get("model_used", ""),
+                    routing=routing,
                 ),
             )
         except BudgetExceededError as exc:
@@ -639,6 +659,8 @@ class PixelHRApp(App[None]):
         self._total_cost   += msg.cost
         self._last_results[msg.agent_id] = msg.result
 
+        if msg.routing:
+            self._log(f"  ⟶ {msg.routing}")
         snippet = (msg.result[:58] + "…") if len(msg.result) > 58 else msg.result
         self._log(f"[{msg.agent_id}] {snippet}")
         if msg.tokens:
@@ -667,6 +689,7 @@ class PixelHRApp(App[None]):
 
         self._update_budget_bar()
         self._update_roster()
+        self._update_office_map()
 
     def on_cost_estimate(self, msg: CostEstimate) -> None:
         model_short = "Haiku" if "haiku" in msg.model.lower() else "Sonnet"
@@ -702,6 +725,7 @@ class PixelHRApp(App[None]):
         if sprite:
             sprite.move_to(sprite.home_zone)
             sprite.set_idle(False)
+        self._update_office_map()
 
     # ── Cost callback (called from worker thread) ─────────────────────────────
 
@@ -773,6 +797,17 @@ class PixelHRApp(App[None]):
         except Exception:
             pass
 
+    def _update_office_map(self) -> None:
+        zone_agents: dict[str, list[str]] = {}
+        for name, sprite in self._sprites.items():
+            zone = getattr(sprite, "current_zone", None)
+            if zone:
+                zone_agents.setdefault(zone, []).append(name)
+        try:
+            self.query_one("#office-map", Static).update(make_live_map(zone_agents))
+        except Exception:
+            pass
+
     def _show_banner(self, text: str, color: str = "#FF4444") -> None:
         try:
             banner = self.query_one("#night-watch-banner", Static)
@@ -784,8 +819,9 @@ class PixelHRApp(App[None]):
             pass
 
     def _log(self, text: str) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
         try:
-            self.query_one("#agent-log", Log).write_line(text)
+            self.query_one("#agent-log", Log).write_line(f"[{ts}] {text}")
         except Exception:
             pass
 
