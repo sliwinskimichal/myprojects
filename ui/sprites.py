@@ -106,10 +106,18 @@ class AgentSprite(Static):
 
     # ── Public API ────────────────────────────────────────────────────────────
 
+    # Maximum safe offsets to keep sprites visible inside the map container.
+    # These are generous bounds; actual map is ~64 cols × 18 rows.
+    _MAX_X = 60
+    _MAX_Y = 16
+
     def move_to(self, zone: str) -> None:
         if zone not in ZONES:
             return
         x, y = ZONES[zone]
+        # Guard: clamp to visible area so sprites never escape the container
+        x = max(0, min(x, self._MAX_X))
+        y = max(0, min(y, self._MAX_Y))
         self.current_zone = zone
         self.styles.animate(
             "offset",

@@ -49,10 +49,16 @@ class SpeechBubble(Static):
         self._sprite_offset = sprite_offset
         self._duration = duration
 
+    # Bubble is 24 chars wide; keep it inside a ~64-col container
+    _MAX_BUBBLE_X = 38   # 64 - 24 - 2 margin
+    _MAX_BUBBLE_Y = 15
+
     def on_mount(self) -> None:
-        # Position to the right of the sprite; move left a bit if near edge
+        # Position to the right of the sprite; clamp so it stays on-screen
         x = self._sprite_offset.x + 8
-        y = max(0, self._sprite_offset.y - 1)
+        y = self._sprite_offset.y - 1
+        x = max(0, min(x, self._MAX_BUBBLE_X))
+        y = max(0, min(y, self._MAX_BUBBLE_Y))
         self.styles.offset = Offset(x, y)
         self.styles.border = ("solid", self._agent_color)
 

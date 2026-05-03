@@ -1,0 +1,26 @@
+# Pixel HR Office — configuration
+# Copy this file to config.local.toml to override without touching git.
+# Environment variables always take precedence over file values.
+
+[api]
+# anthropic_api_key = "sk-ant-..."   # or set ANTHROPIC_API_KEY env var
+daily_budget_usd = 1.0               # USD cap per process session
+
+[app]
+default_context  = "HR_Office"       # HR_Office | Software_House | Startup
+demo_interval    = 5.0               # seconds between demo sprite movements
+log_max_lines    = 500
+
+[night_watch]
+run_at           = ""                # HH:MM daily run time, e.g. "08:00"; empty = manual only
+interval_seconds = 3600              # fallback polling interval in daemon mode
+
+[db]
+sqlite_path  = "pixel_hr.db"
+chroma_path  = "./chroma_db"
+
+[limits]
+max_tokens_default  = 1024
+max_tokens_short    = 160            # accountant, qa_critic
+max_tokens_medium   = 256            # librarian, recruiter, orchestrator
+max_tokens_long     = 350            # comms_expert, tester, analyst

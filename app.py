@@ -19,14 +19,12 @@ Key bindings:
 
 from __future__ import annotations
 
-import os
 import re
 from typing import Any
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container
-from textual.geometry import Offset
 from textual.message import Message
 from textual.widgets import Footer, Header, Log, Static
 
@@ -36,8 +34,9 @@ from ui.sprites import AGENT_DEFS, AgentSprite, create_sprites_for
 from ui.dialogs import ContextSelectScreen, FeedbackScreen, TaskInputScreen
 from ui.history_screen import HistoryScreen
 from db.memory import Database, VectorMemory
-from engine.agents import AgentState, TokenAccountant, improve_skill
-from engine.contexts import ALL_CONTEXTS, next_context
+from engine.agents import AgentState, BudgetExceededError, TokenAccountant, improve_skill
+from engine.config import cfg
+from engine.contexts import ALL_CONTEXTS
 from engine.office_graph import build_graph
 
 # ── Custom messages ────────────────────────────────────────────────────────────
@@ -75,6 +74,15 @@ class AgentSpawned(Message):
     def __init__(self, agent_id: str) -> None:
         super().__init__()
         self.agent_id = agent_id
+
+
+class WorkerError(Message):
+    """Carries a structured error from a background worker to the UI thread."""
+    def __init__(self, agent_id: str, error: str, is_budget: bool = False) -> None:
+        super().__init__()
+        self.agent_id  = agent_id
+        self.error     = error
+        self.is_budget = is_budget
 
 
 # ── Main App ──────────────────────────────────────────────────────────────────
@@ -253,20 +261,20 @@ class PixelHRApp(App[None]):
 
     def __init__(self) -> None:
         super().__init__()
-        self._db        = Database("pixel_hr.db")
-        self._vector    = VectorMemory("./chroma_db")
+        self._db        = Database(cfg.db.sqlite_path)
+        self._vector    = VectorMemory(cfg.db.chroma_path)
         self._accountant = TokenAccountant(
             db=self._db,
-            api_key=os.environ.get("ANTHROPIC_API_KEY"),
+            api_key=cfg.api.anthropic_api_key,
             cost_callback=self._on_cost_estimate,
-            daily_budget_usd=float(os.environ.get("DAILY_BUDGET_USD", "1.0")),
+            daily_budget_usd=cfg.api.daily_budget_usd,
         )
         self._graph           = None
         self._sprites:        dict[str, AgentSprite] = {}
         self._total_tokens    = 0
         self._total_cost      = 0.0
         self._demo_step       = 0
-        self._current_context = "HR_Office"
+        self._current_context = cfg.app.default_context
         self._active_agents:  list[str] = []
         self._last_results:   dict[str, str] = {}
         self._bubble_counter  = 0
@@ -327,7 +335,7 @@ class PixelHRApp(App[None]):
                 self._db.mark_delivered(row["id"])
 
         self._update_budget_bar()
-        self.set_interval(5.0, self._demo_loop)
+        self.set_interval(cfg.app.demo_interval, self._demo_loop)
         self.set_interval(15.0, self._update_budget_bar)
 
     # ── Context management ────────────────────────────────────────────────────
@@ -543,26 +551,29 @@ class PixelHRApp(App[None]):
     def _graph_worker(self, state: dict[str, Any]) -> None:
         if self._graph is None:
             return
+        agent_id = state.get("agent_id", "?")
         try:
             result = self._graph.invoke(state)
             self.call_from_thread(
                 self.post_message,
                 TaskCompleted(
-                    agent_id=result.get("agent_id", state.get("agent_id", "?")),
+                    agent_id=result.get("agent_id", agent_id),
                     result=result.get("last_result", ""),
                     cost=result.get("cost_usd", 0.0),
                     tokens=result.get("tokens_used", 0),
                     model=result.get("model_used", ""),
                 ),
             )
-        except RuntimeError as exc:
-            if "budget" in str(exc).lower():
-                self.call_from_thread(self._log, f"[BUDGET] {exc}")
-                self.call_from_thread(self._update_budget_bar)
-            else:
-                self.call_from_thread(self._log, f"[ERROR] {exc}")
+        except BudgetExceededError as exc:
+            self.call_from_thread(
+                self.post_message,
+                WorkerError(agent_id, str(exc), is_budget=True),
+            )
         except Exception as exc:
-            self.call_from_thread(self._log, f"[ERROR] {exc}")
+            self.call_from_thread(
+                self.post_message,
+                WorkerError(agent_id, f"{type(exc).__name__}: {exc}"),
+            )
 
     def _night_watch_worker(self) -> None:
         tasks = [
@@ -591,8 +602,17 @@ class PixelHRApp(App[None]):
                             model=result.get("model_used", ""),
                         ),
                     )
+            except BudgetExceededError as exc:
+                self.call_from_thread(
+                    self.post_message,
+                    WorkerError(agent_id, str(exc), is_budget=True),
+                )
+                break   # stop remaining night-watch tasks if budget exhausted
             except Exception as exc:
-                self.call_from_thread(self._log, f"[Night ERROR] {agent_id}: {exc}")
+                self.call_from_thread(
+                    self.post_message,
+                    WorkerError(agent_id, f"{type(exc).__name__}: {exc}"),
+                )
 
     def _improve_skill_worker(
         self, agent_id: str, feedback: str, last_output: str
@@ -607,7 +627,10 @@ class PixelHRApp(App[None]):
                 SkillImproved(agent_id, instruction, skill["skill_level"]),
             )
         except Exception as exc:
-            self.call_from_thread(self._log, f"[Skill ERROR] {exc}")
+            self.call_from_thread(
+                self.post_message,
+                WorkerError(agent_id, f"improve_skill failed: {type(exc).__name__}: {exc}"),
+            )
 
     # ── Message handlers ──────────────────────────────────────────────────────
 
@@ -666,6 +689,19 @@ class PixelHRApp(App[None]):
 
     def on_agent_spawned(self, msg: AgentSpawned) -> None:
         self._log(f"★ {msg.agent_id} joined the office!")
+
+    def on_worker_error(self, msg: WorkerError) -> None:
+        if msg.is_budget:
+            self._log(f"[BUDGET ⛔] {msg.agent_id}: budget cap reached")
+            self._show_banner("⛔ Budget cap reached — increase DAILY_BUDGET_USD", color="#FF4444")
+            self._update_budget_bar()
+        else:
+            self._log(f"[ERROR ✗] {msg.agent_id}: {msg.error}")
+        # Return sprite to idle so it doesn't stay in "working" state
+        sprite = self._sprites.get(msg.agent_id)
+        if sprite:
+            sprite.move_to(sprite.home_zone)
+            sprite.set_idle(False)
 
     # ── Cost callback (called from worker thread) ─────────────────────────────
 

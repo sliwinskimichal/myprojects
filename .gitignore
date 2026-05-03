@@ -7,3 +7,5 @@ chroma_db/
 *.egg-info/
 .venv/
 venv/
+config.local.toml
+task_history_*.txt
